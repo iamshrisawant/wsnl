@@ -104,21 +104,133 @@ plt.title("Grid Deployment")
 plt.show()
 ```
 
-MATLAB implementation (alternative)
+Alternate implementation
 
 ```
-N = 50;
-area = 100;
+# Experiment 1 — realistic demo (Colab-ready)
+# Generates Random / Uniform / Grid deployments,
+# estimates area coverage by Monte-Carlo sampling,
+# computes connectivity stats (graph) and a simple Tx energy cost model.
 
-xr = area*rand(1,N);
-yr = area*rand(1,N);
+import numpy as np
+import matplotlib.pyplot as plt
+import networkx as nx
+import math
+from tqdm import trange
 
-n = sqrt(N);
-[xg, yg] = meshgrid(linspace(0,area,n), linspace(0,area,n));
+# --- parameters (changeable during demo) ---
+AREA = 100.0               # side of square area in meters
+N = 49                     # number of nodes (choose a perfect square for grid)
+sensing_r = 12.0           # sensing radius (meters)
+comm_r = 25.0              # communication range (meters)
+mc_samples = 40000         # Monte Carlo samples to estimate coverage (higher -> better estimate)
+np.random.seed(42)
 
-subplot(1,3,1); scatter(xr, yr); title("Random Deployment");
-subplot(1,3,2); scatter(xg(:), yg(:)); title("Uniform Deployment");
-subplot(1,3,3); scatter(xg, yg); title("Grid Deployment");
+# --- helper functions ---
+def deploy_random(n, area):
+    return np.random.rand(n, 2) * area
+
+def deploy_uniform(n, area):
+    # try to create near-uniform spacing by jittering grid points
+    s = int(round(math.sqrt(n)))
+    xs = np.linspace(area/(2*s), area-area/(2*s), s)
+    grid = np.array(np.meshgrid(xs, xs)).T.reshape(-1,2)
+    # if n < s^2, trim; if n > s^2, pad with random
+    pts = grid[:n]
+    jitter = (np.random.rand(len(pts),2)-0.5) * (area/s*0.1)  # small jitter
+    return pts + jitter
+
+def deploy_grid(n, area):
+    s = int(round(math.sqrt(n)))
+    xs = np.linspace(0, area, s)
+    xv, yv = np.meshgrid(xs, xs)
+    pts = np.vstack((xv.flatten(), yv.flatten())).T
+    return pts[:n]
+
+def estimate_coverage(nodes, sensing_r, area, samples=20000):
+    # Monte Carlo: fraction of random points within any sensor circle
+    pts = np.random.rand(samples,2) * area
+    # vectorized distance check
+    dx = pts[:,0][:,None] - nodes[:,0][None,:]
+    dy = pts[:,1][:,None] - nodes[:,1][None,:]
+    d2 = dx*dx + dy*dy
+    covered = (d2 <= sensing_r**2).any(axis=1)
+    return covered.mean()  # fraction covered
+
+def connectivity_stats(nodes, comm_r):
+    n = len(nodes)
+    G = nx.Graph()
+    G.add_nodes_from(range(n))
+    # add edges for pairs within comm_r
+    for i in range(n):
+        for j in range(i+1,n):
+            if np.linalg.norm(nodes[i]-nodes[j]) <= comm_r:
+                G.add_edge(i,j)
+    comps = nx.number_connected_components(G)
+    avg_degree = np.mean([d for _, d in G.degree()]) if n>0 else 0
+    # average shortest path length from node 0 to others (if connected)
+    if nx.is_connected(G):
+        avg_sp = nx.average_shortest_path_length(G)
+    else:
+        avg_sp = None
+    return {'graph': G, 'components': comps, 'avg_degree': avg_degree, 'avg_shortest_path': avg_sp}
+
+def tx_energy_cost(nodes, comm_r, E_tx_per_meter=0.0001):
+    # simple model: sending a packet cost proportional to distance^2 (free-space)
+    # compute average transmission energy for each node to its nearest neighbor toward sink (node 0 acting as sink)
+    n = len(nodes)
+    sink = nodes[0]
+    costs = []
+    for i in range(n):
+        d = np.linalg.norm(nodes[i]-sink)
+        if d <= comm_r:
+            costs.append(E_tx_per_meter * d**2)  # direct
+        else:
+            # multi-hop via nearest neighbor within comm range
+            # find nearest neighbor within comm range; if none, assume very high cost
+            dists = np.linalg.norm(nodes - nodes[i], axis=1)
+            candidates = dists[(dists>0) & (dists<=comm_r)]
+            if len(candidates)==0:
+                costs.append(E_tx_per_meter * (d**2) * 2) # penalize disconnected
+            else:
+                # assume one hop to neighbor + neighbor to sink (approx)
+                costs.append(E_tx_per_meter * ( (candidates.min())**2 + (d - candidates.min())**2 ))
+    return np.mean(costs)
+
+# --- run deployments and collect metrics ---
+deployments = {
+    'Random' : deploy_random(N, AREA),
+    'Uniform' : deploy_uniform(N, AREA),
+    'Grid' : deploy_grid(N, AREA)
+}
+
+results = {}
+for name, nodes in deployments.items():
+    cov = estimate_coverage(nodes, sensing_r, AREA, samples=mc_samples)
+    conn = connectivity_stats(nodes, comm_r)
+    etx = tx_energy_cost(nodes, comm_r)
+    results[name] = {'coverage': cov, 'components': conn['components'],
+                     'avg_degree': conn['avg_degree'], 'avg_sp': conn['avg_shortest_path'],
+                     'avg_tx_energy': etx, 'nodes': nodes, 'graph': conn['graph']}
+
+# --- print concise summary ---
+for name, r in results.items():
+    print(f"{name:8s} | Coverage: {r['coverage']*100:5.1f}% | Components: {r['components']:2d} | "
+          f"AvgDeg: {r['avg_degree']:.2f} | AvgSP: {str(r['avg_sp']):8s} | AvgTxE: {r['avg_tx_energy']:.6f}")
+
+# --- plotting for demo ---
+fig, axs = plt.subplots(1,3, figsize=(15,4))
+for ax, (name, r) in zip(axs, results.items()):
+    nodes = r['nodes']
+    ax.scatter(nodes[:,0], nodes[:,1], s=40)
+    # draw sensing circles (semi-transparent)
+    for xy in nodes:
+        circ = plt.Circle((xy[0], xy[1]), sensing_r, color='C0', alpha=0.06)
+        ax.add_artist(circ)
+    ax.set_title(f"{name}\nCov={r['coverage']*100:.1f}% Comp={r['components']}")
+    ax.set_xlim(0, AREA); ax.set_ylim(0, AREA); ax.set_aspect('equal')
+plt.tight_layout()
+plt.show()
 ```
 
 Key observations during performance
