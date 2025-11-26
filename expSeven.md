@@ -108,28 +108,166 @@ reduction = (1 / len(data)) * 100
 print("Data Reduction (%):", reduction)
 ```
 
-MATLAB implementation (alternative)
-
+Alternate Implementation
 ```
-data = randi([20 40], 1, 50);
+# Experiment 7: Data Aggregation Techniques (Colab-ready)
+# Demonstrates cluster-based aggregation vs raw forwarding.
+# Author: ChatGPT (adapted for exam/demo use)
 
-avg_val = mean(data);
-sum_val = sum(data);
-min_val = min(data);
-max_val = max(data);
+import numpy as np
+import matplotlib.pyplot as plt
 
-disp("Original Data Count:");
-disp(length(data));
+np.random.seed(42)
 
-disp("Transmitted After Aggregation: 1");
+# PARAMETERS
+AREA = 100                 # square area (0..AREA)
+N = 100                    # number of sensors
+Kx, Ky = 4, 4              # grid clusters (Kx * Ky clusters)
+CH_PER_CLUSTER = 1         # cluster head count (simple: 1 per cell)
+SINK = np.array([AREA/2, AREA+20])  # sink placed outside area (to simulate real-world)
+E_TX_BASE = 50e-6          # energy per packet (Joule) for electronics (base)
+E_TX_DIST = 1e-6           # additional energy factor per m^2
+E_RX = 50e-6               # energy to receive one packet (Joule)
+E_PROC = 5e-6              # energy to aggregate/process one packet (Joule)
+PKT_SIZE = 1               # normalized packet size (unit)
 
-disp("Average:"); disp(avg_val);
-disp("Sum:"); disp(sum_val);
-disp("Min:"); disp(min_val);
-disp("Max:"); disp(max_val);
+# 1. Deploy nodes randomly (or use poisson - keep random for realism)
+nodes_xy = AREA * np.random.rand(N, 2)
 
-reduction = (1 / length(data)) * 100;
-disp("Data Reduction (%):"); disp(reduction);
+# 2. Create a spatially correlated field (smooth gaussian field)
+#    Base temperature field: linear gradient + smooth noise
+x = np.linspace(0, AREA, 50)
+y = np.linspace(0, AREA, 50)
+X, Y = np.meshgrid(x, y)
+base_field = 20 + (X + Y) * 0.05  # slight gradient
+# Add smooth noise by convolving white noise (approx) - emulate with low-freq components
+noise = 2 * np.sin(0.1 * X) * np.cos(0.12 * Y)
+field = base_field + noise
+
+# sample field values at node positions (bilinear interpolation approximation)
+def sample_field(xy):
+    x_idx = np.clip((xy[:,0] / AREA * (x.size-1)).astype(int), 0, x.size-2)
+    y_idx = np.clip((xy[:,1] / AREA * (y.size-1)).astype(int), 0, y.size-2)
+    return field[y_idx, x_idx] + np.random.normal(0, 0.5, len(x_idx))  # measurement noise
+
+readings = sample_field(nodes_xy)
+
+# 3. Partition nodes into grid clusters (Kx x Ky)
+def assign_cluster(xy, Kx, Ky, area):
+    # integer coords 0..Kx-1, 0..Ky-1
+    ix = np.minimum((xy[:,0] / area * Kx).astype(int), Kx-1)
+    iy = np.minimum((xy[:,1] / area * Ky).astype(int), Ky-1)
+    return ix + iy * Kx
+
+clusters = assign_cluster(nodes_xy, Kx, Ky, AREA)
+num_clusters = Kx * Ky
+
+# pick cluster heads: choose node nearest to cluster centroid
+cluster_heads = np.full(num_clusters, -1, dtype=int)
+for c in range(num_clusters):
+    members = np.where(clusters == c)[0]
+    if members.size == 0:
+        continue
+    # cluster centroid
+    cx = ( (c % Kx) + 0.5 ) * (AREA / Kx)
+    cy = ( (c // Kx) + 0.5 ) * (AREA / Ky)
+    dists = np.linalg.norm(nodes_xy[members] - np.array([cx, cy]), axis=1)
+    cluster_heads[c] = members[np.argmin(dists)]
+
+# ensure cluster_heads unique and valid
+cluster_heads = cluster_heads[cluster_heads >= 0]
+
+# 4. Utility functions for energy and packet counting
+def tx_energy(distance_m, pkt_size=PKT_SIZE):
+    # simple energy model: E = E_TX_BASE * pkt_size + E_TX_DIST * distance^2 * pkt_size
+    return (E_TX_BASE * pkt_size) + (E_TX_DIST * (distance_m**2) * pkt_size)
+
+def rx_energy(pkt_size=PKT_SIZE):
+    return E_RX * pkt_size
+
+# 5. Scenario A: Raw forwarding (every node -> sink)
+packets_raw = N
+total_E_raw = 0.0
+for i in range(N):
+    d = np.linalg.norm(nodes_xy[i] - SINK)
+    total_E_raw += tx_energy(d)
+# no Rx counted at sink for energy accounting (sink is mains-powered usually)
+
+# 6. Scenario B: Cluster aggregation (node -> CH; CH aggregates; CH -> sink)
+packets_to_CH = 0
+packets_CH_to_sink = 0
+total_E_agg = 0.0
+
+for c in range(num_clusters):
+    members = np.where(clusters == c)[0]
+    if members.size == 0:
+        continue
+    ch = cluster_heads[c]
+    # sensors send to CH
+    for m in members:
+        if m == ch:
+            continue
+        d = np.linalg.norm(nodes_xy[m] - nodes_xy[ch])
+        total_E_agg += tx_energy(d)         # node tx
+        total_E_agg += rx_energy()         # CH rx
+        packets_to_CH += 1
+    # CH processes/aggregates data
+    # cost: process N_members packets into 1 (processing cost)
+    total_E_agg += E_PROC * members.size
+    # CH sends 1 aggregated packet to sink
+    d_ch_sink = np.linalg.norm(nodes_xy[ch] - SINK)
+    total_E_agg += tx_energy(d_ch_sink)
+    packets_CH_to_sink += 1
+
+# 7. Compute aggregation accuracy for mean: compare true mean vs aggregated mean
+true_mean = readings.mean()
+# aggregated mean reconstructed at sink: weighted by cluster sizes using cluster-head averages
+agg_values = []
+cluster_sizes = []
+for c in range(num_clusters):
+    members = np.where(clusters == c)[0]
+    if members.size == 0: continue
+    ch = cluster_heads[c]
+    cluster_mean = readings[members].mean()
+    agg_values.append(cluster_mean)
+    cluster_sizes.append(members.size)
+# reconstructed global mean using cluster means and sizes
+recon_mean = np.average(agg_values, weights=cluster_sizes)
+mean_error = abs(recon_mean - true_mean)
+
+# 8. Print and plot results
+print("Experiment 7: Data Aggregation (cluster-based)")
+print(f"Number of nodes: {N}")
+print(f"Clusters (grid): {Kx} x {Ky} = {num_clusters}")
+print(f"Raw forwarding packets (to sink): {packets_raw}")
+print(f"Aggregation: packets to CH (intermediate): {packets_to_CH}, CH->sink packets: {packets_CH_to_sink}")
+print(f"Total TX energy (raw forwarding): {total_E_raw:.6f} J")
+print(f"Total TX+RX+proc energy (aggregation): {total_E_agg:.6f} J")
+print(f"Energy saved by aggregation: {100*(1 - total_E_agg/total_E_raw):.2f}%")
+print(f"True global mean: {true_mean:.3f}, Reconstructed mean at sink: {recon_mean:.3f}")
+print(f"Absolute mean error due to aggregation: {mean_error:.4f}")
+
+# Visualizations
+plt.figure(figsize=(14,5))
+
+plt.subplot(1,3,1)
+plt.scatter(nodes_xy[:,0], nodes_xy[:,1], c=readings, cmap='coolwarm', s=30, edgecolor='k')
+for ch in cluster_heads:
+    plt.scatter(nodes_xy[ch,0], nodes_xy[ch,1], marker='*', s=180, c='gold', edgecolor='k')
+plt.scatter(SINK[0], SINK[1], marker='D', s=120, c='green', label='Sink', edgecolor='k')
+plt.title('Node Locations & Cluster Heads (stars)')
+plt.xlabel('X'); plt.ylabel('Y'); plt.colorbar(label='Reading')
+
+plt.subplot(1,3,2)
+plt.bar(['Raw packets','Packets to CH','Packets CH->Sink'], [packets_raw, packets_to_CH, packets_CH_to_sink])
+plt.title('Packet Counts')
+
+plt.subplot(1,3,3)
+plt.bar(['Raw Energy (J)','Aggregated Energy (J)'], [total_E_raw, total_E_agg])
+plt.title('Energy Comparison')
+
+plt.tight_layout()
+plt.show()
 ```
 
 Key observations during performance

@@ -241,3 +241,176 @@ Key observations during performance
 
 Conclusion
 Grid deployment provides the most efficient and reliable coverage, uniform deployment gives balanced spacing, and random deployment results in unpredictable coverage patterns.
+
+---
+
+AI-based approaches add intelligence to deployment. Two easy-to-use ideas are clustering and optimisation. Clustering (for example K-Means) places nodes at centroids of important regions — useful when some areas are more important or when you have a heatmap of interest. Optimisation treats node positions as variables and maximises a fitness (for example coverage minus penalties for disconnected components or high tx-energy); simple methods like a genetic algorithm or hill-climb can find better placements than pure random placement in many cases.
+
+Clustering (K-Means) — sample points across the area (or use a weighted heatmap), run K-Means with `k = number_of_nodes`, and use the centroids as node positions. This concentrates nodes where they are most needed while keeping the method fast and deterministic.
+
+Simple optimisation (GA / hill-climb) — represent all node coordinates as a single vector, define a fitness that rewards coverage and connectivity and penalises high tx energy, then apply a population-based search (or repeated random local improvements). Even a small GA or repeated random-restarts hill-climb often improves coverage over a single random deployment.
+
+```python
+# Self-contained demo: Random, Uniform, Grid, KMeans, Simple Hill-Climb
+# Paste into Colab or Jupyter. Requires: numpy, matplotlib, networkx, sklearn
+# If sklearn not installed in Colab: !pip install scikit-learn
+
+import numpy as np
+import matplotlib.pyplot as plt
+import networkx as nx
+from sklearn.cluster import KMeans
+import random
+import math
+import time
+
+# ---------- parameters ----------
+AREA = 100.0
+N = 49                    # choose a perfect square (7x7) for nicer grid
+SENSING_R = 12.0
+COMM_R = 25.0
+MC_SAMPLES = 25000
+SEED = 42
+np.random.seed(SEED)
+random.seed(SEED)
+
+# ---------- deployment generators ----------
+def deploy_random(n, area):
+    return np.random.rand(n,2) * area
+
+def deploy_uniform(n, area):
+    s = int(round(math.sqrt(n)))
+    if s*s < n: s += 1
+    xs = np.linspace(area/(2*s), area-area/(2*s), s)
+    grid = np.array(np.meshgrid(xs, xs)).T.reshape(-1,2)
+    pts = grid[:n]
+    jitter = (np.random.rand(len(pts),2)-0.5) * (area/s*0.04)
+    return np.clip(pts + jitter, 0.0, area)
+
+def deploy_grid(n, area):
+    s = int(round(math.sqrt(n)))
+    if s*s < n: s += 1
+    xs = np.linspace(0, area, s)
+    xv, yv = np.meshgrid(xs, xs)
+    pts = np.vstack((xv.flatten(), yv.flatten())).T
+    return pts[:n]
+
+def deploy_kmeans(n, area, samples=4000):
+    pts = np.random.rand(samples,2) * area
+    km = KMeans(n_clusters=n, random_state=SEED, n_init=5).fit(pts)
+    cents = np.clip(km.cluster_centers_, 0.0, area)
+    return cents
+
+# ---------- performance helpers ----------
+def estimate_coverage(nodes, sensing_r, area, samples=20000):
+    pts = np.random.rand(samples,2) * area
+    dx = pts[:,0][:,None] - nodes[:,0][None,:]
+    dy = pts[:,1][:,None] - nodes[:,1][None,:]
+    d2 = dx*dx + dy*dy
+    covered = (d2 <= sensing_r**2).any(axis=1)
+    return covered.mean()  # fraction
+
+def connectivity_stats(nodes, comm_r):
+    n = len(nodes)
+    G = nx.Graph()
+    G.add_nodes_from(range(n))
+    for i in range(n):
+        for j in range(i+1,n):
+            if np.linalg.norm(nodes[i]-nodes[j]) <= comm_r:
+                G.add_edge(i,j)
+    comps = nx.number_connected_components(G)
+    avg_degree = np.mean([d for _,d in G.degree()]) if n>0 else 0.0
+    avg_sp = None
+    if nx.is_connected(G):
+        try:
+            avg_sp = nx.average_shortest_path_length(G)
+        except Exception:
+            avg_sp = None
+    return {'graph': G, 'components': comps, 'avg_degree': avg_degree, 'avg_shortest_path': avg_sp}
+
+def tx_energy_cost(nodes, comm_r, E_tx_per_meter=0.0001):
+    n = len(nodes)
+    sink = nodes[0]  # choose node 0 as sink for cost estimate
+    costs = []
+    for i in range(n):
+        d = np.linalg.norm(nodes[i]-sink)
+        if d <= comm_r:
+            costs.append(E_tx_per_meter * d**2)
+        else:
+            dists = np.linalg.norm(nodes - nodes[i], axis=1)
+            candidates = dists[(dists>0) & (dists<=comm_r)]
+            if len(candidates) == 0:
+                costs.append(E_tx_per_meter * (d**2) * 2.0)
+            else:
+                costs.append(E_tx_per_meter * ( (candidates.min())**2 + (d - candidates.min())**2 ))
+    return np.mean(costs)
+
+# ---------- simple hill-climb optimizer ----------
+def example_score(nodes):
+    cov = estimate_coverage(nodes, SENSING_R, AREA, samples=6000)
+    conn = connectivity_stats(nodes, COMM_R)
+    score = cov - 0.05*(conn['components'] - 1)  # coverage preferred, penalize components
+    return score
+
+def simple_hill_climb(n, area, steps=2000, step_size=6.0):
+    nodes = np.random.rand(n,2) * area
+    best_score = example_score(nodes)
+    for _ in range(steps):
+        i = np.random.randint(0, n)
+        cand = nodes.copy()
+        cand[i] += (np.random.rand(2)-0.5) * step_size
+        cand = np.clip(cand, 0.0, area)
+        s = example_score(cand)
+        if s > best_score:
+            nodes, best_score = cand, s
+    return nodes
+
+# ---------- run methods ----------
+methods = {
+    'Random': deploy_random,
+    'Uniform': deploy_uniform,
+    'Grid': deploy_grid,
+    'KMeans': deploy_kmeans,
+    'HillClimb': lambda n, area: simple_hill_climb(n, area, steps=1800, step_size=6.0)
+}
+
+results = {}
+start_all = time.time()
+for name, fn in methods.items():
+    t0 = time.time()
+    if name == 'KMeans':
+        nodes = fn(N, AREA, samples=6000)
+    else:
+        nodes = fn(N, AREA)
+    cov = estimate_coverage(nodes, SENSING_R, AREA, samples=MC_SAMPLES)
+    conn = connectivity_stats(nodes, COMM_R)
+    etx = tx_energy_cost(nodes, COMM_R)
+    results[name] = {'nodes': nodes, 'coverage': cov, 'components': conn['components'],
+                     'avg_degree': conn['avg_degree'], 'avg_sp': conn['avg_shortest_path'],
+                     'avg_tx_energy': etx, 'time': time.time()-t0}
+print(f"Total run time: {time.time()-start_all:.2f} s\n")
+
+# print concise summary
+print(f"{'Method':10s} | {'Coverage':>8s} | {'Comps':>5s} | {'AvgDeg':>6s} | {'AvgTxE':>9s} | {'T(s)':>5s}")
+for name, r in results.items():
+    print(f"{name:10s} | {r['coverage']*100:7.2f}% | {r['components']:5d} | {r['avg_degree']:6.2f} | {r['avg_tx_energy']:9.6f} | {r['time']:5.2f}")
+
+# ---------- plotting ----------
+methods_order = list(results.keys())
+fig, axs = plt.subplots(1, len(methods_order), figsize=(4*len(methods_order), 4))
+if len(methods_order) == 1:
+    axs = [axs]
+for ax, name in zip(axs, methods_order):
+    r = results[name]
+    nodes = r['nodes']
+    ax.scatter(nodes[:,0], nodes[:,1], s=36, zorder=3)
+    for xy in nodes:
+        circ = plt.Circle((xy[0], xy[1]), SENSING_R, alpha=0.07, linewidth=0, zorder=1)
+        ax.add_patch(circ)
+    ax.set_title(f"{name}\nCov={r['coverage']*100:.1f}%  Comp={r['components']}")
+    ax.set_xlim(0, AREA); ax.set_ylim(0, AREA); ax.set_aspect('equal')
+    ax.set_xticks([]); ax.set_yticks([])
+plt.tight_layout()
+plt.show()
+```
+
+*Notes you can add to viva:* clustering is fast and good for known hotspot maps; optimisation (GA/PSO/hill-climb) is flexible for multi-objective tuning but needs compute and careful fitness design.
